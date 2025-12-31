@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+import csv
+import json
+from pathlib import Path
+import sys
+
+# GUI picker (tkinter). Falls back to console path input if not available.
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
+
+# Optional pandas for Excel
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except Exception:
+    PANDAS_AVAILABLE = False
+
+ALIAS_PATH = Path("alias.json")
+DEFAULT_SOURCE = "hkjc"  # change if you want a different default
+
+def load_alias():
+    if ALIAS_PATH.exists():
+        try:
+            return json.loads(ALIAS_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Failed to read alias.json, starting fresh: {e}")
+    return {"teams": {}, "leagues": {}}
+
+def save_alias(data):
+    ALIAS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"alias.json updated ({ALIAS_PATH.resolve()})")
+
+def dedup(seq):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def patch_entries(data, kind, names, source):
+    if kind not in ("teams", "leagues"):
+        raise ValueError("kind must be 'teams' or 'leagues'")
+    bucket = data.setdefault(kind, {})
+    patched = {}
+    skipped = 0
+    for canon in names:
+        if not canon:
+            continue
+        if canon in bucket:
+            skipped += 1
+            continue
+        entry = bucket.setdefault(canon, {"variants": [], "sources": {}})
+        entry["variants"] = dedup(entry.get("variants", []) + [canon])
+        src_bucket = entry["sources"].setdefault(source, [])
+        src_bucket = dedup(src_bucket + [canon])
+        entry["sources"][source] = src_bucket
+        bucket[canon] = entry
+        patched[canon] = entry
+    data[kind] = bucket
+    return data, patched, skipped
+
+def validate_alias(path: Path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"❌ Validation failed: cannot read JSON: {e}")
+        return False, None
+    if not isinstance(data, dict):
+        print("❌ Validation failed: top-level is not an object")
+        return False, data
+    if "teams" not in data or "leagues" not in data:
+        print("❌ Validation warning: missing 'teams' or 'leagues' keys")
+    if not isinstance(data.get("teams", {}), dict):
+        print("❌ Validation failed: 'teams' is not an object")
+        return False, data
+    print("✅ alias.json validation OK")
+    return True, data
+
+def pick_file_gui():
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.askopenfilename(
+        title="Select a names file",
+        filetypes=[
+            ("Text/CSV/Excel", "*.txt *.csv *.tsv *.xlsx *.xls"),
+            ("Text files", "*.txt"),
+            ("CSV files", "*.csv *.tsv"),
+            ("Excel files", "*.xlsx *.xls"),
+            ("All files", "*.*"),
+        ],
+    )
+
+def read_txt(path: Path):
+    return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+def read_csv_tsv(path: Path):
+    delim = "\t" if path.suffix.lower() == ".tsv" else ","
+    rows = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter=delim)
+        for row in reader:
+            if not row:
+                continue
+            rows.append(row)
+    if not rows:
+        return []
+    headers = rows[0]
+    header_like = any(h.lower() in ("name", "team", "league") for h in headers)
+    data_rows = rows[1:] if header_like else rows
+    col_idx = 0
+    if header_like:
+        for idx, h in enumerate(headers):
+            if h.lower() in ("name", "team", "league"):
+                col_idx = idx
+                break
+    names = []
+    for r in data_rows:
+        if col_idx < len(r):
+            val = r[col_idx].strip()
+            if val:
+                names.append(val)
+    return names
+
+def read_excel(path: Path):
+    if not PANDAS_AVAILABLE:
+        raise RuntimeError("pandas is required to read Excel (.xlsx/.xls). Please install pandas.")
+    df = pd.read_excel(path, sheet_name=0)
+    if df.empty:
+        return []
+    col_candidates = list(df.columns)
+    preferred = [c for c in col_candidates if str(c).lower() in ("name", "team", "league")]
+    col = preferred[0] if preferred else col_candidates[0]
+    series = df[col].dropna().astype(str).str.strip()
+    return [v for v in series.tolist() if v]
+
+def load_names(path: Path):
+    ext = path.suffix.lower()
+    if ext == ".txt":
+        return read_txt(path)
+    if ext in (".csv", ".tsv"):
+        return read_csv_tsv(path)
+    if ext in (".xlsx", ".xls"):
+        return read_excel(path)
+    return read_txt(path)  # fallback
+
+def main():
+    kind = input("Add to teams or leagues? [teams/leagues] (default: teams): ").strip().lower() or "teams"
+    if kind not in ("teams", "leagues"):
+        print("Invalid choice. Use 'teams' or 'leagues'.")
+        sys.exit(1)
+
+    source = input(f"Source tag? (default: {DEFAULT_SOURCE}): ").strip().lower() or DEFAULT_SOURCE
+
+    if TK_AVAILABLE:
+        fname = pick_file_gui()
+        if not fname:
+            print("No file selected. Exiting.")
+            sys.exit(0)
+    else:
+        fname = input("Path to txt/csv/tsv/xlsx/xls file (one name per line or first column): ").strip()
+        if not fname:
+            print("No file provided. Exiting.")
+            sys.exit(0)
+
+    path = Path(fname)
+    if not path.exists():
+        print(f"File not found: {path}")
+        sys.exit(1)
+
+    try:
+        names = load_names(path)
+    except Exception as e:
+        print(f"Failed to load names from {path}: {e}")
+        sys.exit(1)
+
+    if not names:
+        print("No names found in file.")
+        sys.exit(0)
+
+    print(f"Loaded {len(names)} names from {path.name}")
+    data = load_alias()
+    data, patched, skipped = patch_entries(data, kind, names, source)
+    save_alias(data)
+
+    ok, reread = validate_alias(ALIAS_PATH)
+    if ok and reread:
+        print(f"\nPatched entries (first 10 shown):")
+        for i, (canon, entry) in enumerate(patched.items()):
+            if i >= 10:
+                print("... (more entries patched)")
+                break
+            print(f"- {canon}")
+            print(f"  variants: {entry.get('variants')}")
+            for src, vals in entry.get("sources", {}).items():
+                print(f"  source[{src}]: {vals}")
+        print(f"\nSkipped existing canonicals: {skipped}")
+        print(f"Total {kind} now: {len(reread.get(kind, {}))}")
+
+if __name__ == "__main__":
+    main()
