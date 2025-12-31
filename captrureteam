@@ -1,0 +1,212 @@
+import asyncio
+import json
+import os
+from playwright.async_api import async_playwright
+
+URL = "https://live.titan007.com/indexall_big.aspx"
+WINDOW_B_FILE = "windowB.json"
+GAME_FILE = "game.json"
+COLUMNS = 3  # Number of columns for parallel display
+
+
+def load_existing_collection():
+    """Load existing collection from game.json if it exists"""
+    if os.path.exists(GAME_FILE):
+        with open(GAME_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+async def fetch_and_save_windowB():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(URL)
+        await page.wait_for_timeout(3500)  # Let table load
+        b = await page.evaluate("() => window.B")
+        await browser.close()
+    if not b:
+        print("window.B not found!")
+        return []
+    with open(WINDOW_B_FILE, "w", encoding="utf-8") as f:
+        json.dump(b, f, ensure_ascii=False, indent=2)
+    print(f"windowB.json imported: {sum(1 for x in b if x)} items.")
+    return [entry for entry in b if entry]
+
+
+def display_leagues_parallel(winb, existing_collection=None, cols=COLUMNS):
+    """Display leagues in parallel columns, filtering out existing ones"""
+    if existing_collection is None:
+        existing_collection = load_existing_collection()
+
+    # Create sets for quick lookup of existing leagues
+    existing_keys = set()
+    existing_names = set()
+    for item in existing_collection:
+        existing_keys.add((item.get("SclassID", ""), item.get("SubID", "")))
+        existing_names.add((item.get("simp", ""), item.get("trad", "")))
+
+    # Filter out existing leagues
+    filtered_leagues = []
+    for entry in winb:
+        if not entry or len(entry) < 10:
+            continue
+
+        sclass_id = str(entry[4])
+        sub_id = str(entry[9]) if entry[9] is not None else ''
+        simp = entry[0]
+        trad = entry[1]
+        url = entry[8]
+
+        # Check if league already exists in collection
+        if ((sclass_id, sub_id) in existing_keys) or ((simp, trad) in existing_names):
+            continue
+
+        filtered_leagues.append({
+            "SclassID": sclass_id,
+            "SubID": sub_id,
+            "simp": simp,
+            "trad": trad,
+            "url": url
+        })
+
+    # Display results
+    if not filtered_leagues:
+        print("\n=== No New Leagues/Games Available ===")
+        print("All leagues from the source are already in your collection.")
+        return []
+
+    rows = (len(filtered_leagues) + cols - 1) // cols
+    print(f"\n=== Available New Leagues/Games ({len(filtered_leagues)} new) ===")
+    for r in range(rows):
+        line = []
+        for c in range(cols):
+            idx = r + c * rows
+            if idx < len(filtered_leagues):
+                l = filtered_leagues[idx]
+                n = idx + 1
+                line.append(f"{n:2d}. {l['simp']} ({l['trad']}) [SclassID={l['SclassID']} SubID={l['SubID']}]")
+            else:
+                line.append("")
+        print(" | ".join(line))
+
+    # Also show count of filtered out leagues
+    total_leagues = sum(1 for entry in winb if entry and len(entry) >= 10)
+    filtered_out = total_leagues - len(filtered_leagues)
+    if filtered_out > 0:
+        print(f"\nNote: {filtered_out} league(s) are already in your collection and not shown.")
+
+    return filtered_leagues
+
+
+def unique_accumulate(existing, new):
+    keys = {(e["SclassID"], e["SubID"]) for e in existing}
+    names = {(e["simp"], e["trad"]) for e in existing}
+    for n in new:
+        if ((n["SclassID"], n["SubID"]) not in keys) and ((n["simp"], n["trad"]) not in names):
+            existing.append(n)
+    return existing
+
+
+def show_collection():
+    if not os.path.exists(GAME_FILE):
+        print("\nYour collection is currently empty.\n")
+        return []
+    else:
+        with open(GAME_FILE, "r", encoding="utf-8") as f:
+            coll = json.load(f)
+        print("\n=== Your collected games/leagues so far ===")
+        for g in coll:
+            print(f"  {g['simp']} ({g['trad']}) | SclassID:{g['SclassID']} | SubID:{g['SubID']}")
+        print(f"Total: {len(coll)}\n")
+        return coll
+
+
+def prompt_and_save_choices(league_list, existing_collection):
+    """Prompt user to select leagues and save to game.json"""
+    if not league_list:
+        print("No new leagues to add.")
+        return existing_collection
+
+    print("Type q (or quit/exit) at any prompt to exit immediately.")
+    pick = input(
+        "Enter the #s of the leagues/games you want to collect (comma/space separated), or q to quit, or ENTER to keep existing only:\n> ").strip().lower()
+
+    if pick in ("q", "quit", "exit"):
+        print("Bye!")
+        exit(0)
+    if pick == "":
+        print("No changes made.")
+        return existing_collection
+
+    nums = set()
+    for item in pick.replace(',', ' ').split():
+        if item in ("q", "quit", "exit"):
+            print("Bye!")
+            exit(0)
+        try:
+            n = int(item)
+            if 1 <= n <= len(league_list):
+                nums.add(n)
+        except Exception:
+            continue
+
+    to_add = [league_list[n - 1] for n in nums]
+    final = unique_accumulate(existing_collection.copy(), to_add)
+
+    with open(GAME_FILE, "w", encoding="utf-8") as f:
+        json.dump(final, f, ensure_ascii=False, indent=2)
+
+    print(f"\nSaved {len(to_add)} new leagues/games. Total now: {len(final)} in {GAME_FILE}")
+    print("Your complete collection:")
+    for g in final:
+        print(f"  {g['simp']} ({g['trad']}) [SclassID={g['SclassID']}]")
+
+    return final
+
+
+async def main():
+    print("\n[Titan007 League/Game Console Picker — Parallel Edition]")
+    print("[Auto-importing latest league/game list from Titan007...]\n")
+
+    # Load existing collection first
+    existing_collection = load_existing_collection()
+
+    winb = await fetch_and_save_windowB()
+    if not winb:
+        print("Could not import window.B, exiting.")
+        return
+
+    # Display only new leagues (not in existing collection)
+    league_list = display_leagues_parallel(winb, existing_collection)
+
+    while True:
+        if not league_list:
+            print("No new leagues available to add.")
+            break
+
+        existing_collection = prompt_and_save_choices(league_list, existing_collection)
+
+        while True:
+            cmd = input("\n(A)dd more, (S)how collection, (R)efresh list, (Q)uit? [a/s/r/q]: ").strip().lower()
+            if cmd in ("q", "quit", "exit"):
+                print("Bye!")
+                return
+            elif cmd == "s":
+                show_collection()
+            elif cmd == "r":
+                # Refresh the list to show only new leagues
+                print("\nRefreshing list...")
+                league_list = display_leagues_parallel(winb, existing_collection)
+                if not league_list:
+                    print("No new leagues available to add.")
+                break
+            elif cmd == "a" or cmd == "":
+                # Show available again for picking
+                if not league_list:
+                    print("No new leagues available to add.")
+                break
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
