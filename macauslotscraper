@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""
+Fixed Market Data Collector
+- Deterministic pagination (inputs only, capped at 15)
+- Baseline metadata reuse to avoid Unknown/synthetic IDs across markets
+- Captures match date (YYYY-MM-DD) from page header and match time (HH:MM)
+- Cross-midnight handling: if times wrap backward, or first time is early (<06:00) while later times are >=12:00, advance date
+- Skips matches that have already started only when adjusted date+time are known
+- Count mismatches suppressed for all markets
+- No cache skipping (always scrape fresh)
+"""
+
+import asyncio
+import json
+import csv
+import argparse
+import logging
+import sys
+import re
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from playwright.async_api import async_playwright
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+
+class FixedMarketsCollector:
+    def __init__(self, headless: bool = True, output_dir: str = "all_markets_analysis"):
+        self.headless = headless
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.allowed_markets = {
+            "全場三合一賠率", "上半場三合一賠率", "上半場角球數賠率",
+            "上半場波膽", "上半場波膽組合", "上半場入球單/雙數",
+            "上半場球隊入球數", "角球數賠率", "波膽", "波膽組合",
+            "上半場/全場賽果", "入球單/雙數", "全場入球總數",
+            "上/下半場入球較多", "球隊入球數", "最先入球球隊", "首名入球球員",
+        }
+
+        # Expected counts kept for info (no warnings)
+        self.expected_counts = {
+            "全場三合一賠率": 19,
+            "上半場三合一賠率": 7,
+            "上半場角球數賠率": 7,
+            "上半場波膽": 26,
+            "上半場波膽組合": 6,
+            "上半場入球單/雙數": 2,
+            "上半場球隊入球數": 12,
+            "角球數賠率": 7,
+            "波膽": 26,
+            "波膽組合": 6,
+            "上半場/全場賽果": 9,
+            "入球單/雙數": 2,
+            "全場入球總數": 4,
+            "上/下半場入球較多": 3,
+            "球隊入球數": 12,
+            "最先入球球隊": 3,
+            "首名入球球員": 23,
+        }
+
+    async def collect_all(self):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=self.headless, slow_mo=200)
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+
+            try:
+                logger.info("Loading Macau Slot website...")
+                await page.goto(
+                    "https://www.macau-slot.com/content/soccer/coming_bet.html",
+                    timeout=60000,
+                    wait_until="networkidle"
+                )
+
+                await asyncio.sleep(3)
+                await self._set_page_size(page)
+                await asyncio.sleep(2)
+
+                market_names = await self._get_market_tabs(page)
+                if not market_names:
+                    logger.error("No market tabs found!")
+                    return
+
+                logger.info(f"Found {len(market_names)} market tabs")
+                logger.info(f"Markets: {market_names}")
+
+                all_events_data = {}
+                market_idx = 0
+                # baseline[(page_num, match_idx)] -> {event_id, home_team, away_team, match_time, match_date}
+                baseline = {}
+
+                for market_name in market_names:
+                    if market_name not in self.allowed_markets:
+                        continue
+
+                    logger.info(f"\n{'=' * 60}")
+                    logger.info(f"Processing Market {market_idx + 1}/{len(self.allowed_markets)}: {market_name}")
+                    logger.info(f"{'=' * 60}")
+
+                    if not await self._click_market_button(page, market_name):
+                        logger.error(f"Failed to click market: {market_name}")
+                        continue
+
+                    await asyncio.sleep(3)
+                    await page.wait_for_load_state("networkidle")
+
+                    page_numbers = await self._get_real_page_numbers(page)
+                    if not page_numbers:
+                        page_numbers = [1]
+
+                    logger.info(f"  Detected pages: {page_numbers[:10]}{'...' if len(page_numbers) > 10 else ''}")
+
+                    total_processed = 0
+                    total_skipped_started = 0
+
+                    for page_num in page_numbers:
+                        if page_num > 1:
+                            logger.info(f"  📄 Navigating to page {page_num}...")
+                            if not await self._click_page_number(page, page_num):
+                                logger.warning(f"  Failed to navigate to page {page_num}, stopping for this market")
+                                break
+                            await asyncio.sleep(3)
+                            await page.wait_for_load_state("networkidle")
+
+                        page_date_iso = await self._extract_page_date(page)
+
+                        current_matches = await self._get_current_page_matches(page)
+                        if not current_matches:
+                            logger.warning(f"  No matches found on page {page_num}")
+                            break
+
+                        page_seen = len(current_matches)
+                        page_processed = 0
+                        page_skipped = 0
+
+                        logger.info(f"  Page {page_num} date: {page_date_iso or 'Unknown'}; matches found: {page_seen}")
+
+                        # Pre-scan headers to decide initial day offset and rollover
+                        headers = []
+                        times = []
+                        for match_el in current_matches:
+                            home_team, away_team, event_id, match_time = await self._extract_match_header(match_el)
+                            minutes = None
+                            if match_time != "Unknown":
+                                try:
+                                    hh, mm = map(int, match_time.split(":"))
+                                    minutes = hh * 60 + mm
+                                except Exception:
+                                    minutes = None
+                            headers.append({
+                                "el": match_el,
+                                "home": home_team,
+                                "away": away_team,
+                                "event_id": event_id,
+                                "match_time": match_time,
+                                "minutes": minutes,
+                            })
+                            times.append(minutes)
+
+                        initial_offset = 0
+                        if page_date_iso and times:
+                            first = times[0]
+                            has_late = any(t is not None and t >= 720 for t in times)  # >= 12:00
+                            if first is not None and first < 360 and has_late:  # first before 06:00 and later there is late game
+                                initial_offset = 1
+
+                        offset = initial_offset
+                        working_date = None
+                        if page_date_iso:
+                            try:
+                                dt = datetime.strptime(page_date_iso, "%Y-%m-%d") + timedelta(days=offset)
+                                working_date = dt.strftime("%Y-%m-%d")
+                            except Exception:
+                                working_date = page_date_iso
+
+                        prev_minutes = None
+
+                        for match_idx, h in enumerate(headers):
+                            match_el = h["el"]
+                            home_team = h["home"]
+                            away_team = h["away"]
+                            event_id = h["event_id"]
+                            match_time = h["match_time"]
+                            minutes = h["minutes"]
+
+                            key = (page_num, match_idx)
+                            # reuse baseline if available
+                            if key in baseline:
+                                if event_id == "unknown":
+                                    event_id = baseline[key]["event_id"]
+                                if home_team == "Unknown":
+                                    home_team = baseline[key]["home_team"]
+                                if away_team == "Unknown":
+                                    away_team = baseline[key]["away_team"]
+                                if match_time == "Unknown":
+                                    match_time = baseline[key]["match_time"]
+                                if not working_date and baseline[key].get("match_date"):
+                                    working_date = baseline[key]["match_date"]
+
+                            # rollover when time goes backward by >60 minutes
+                            if working_date and minutes is not None and prev_minutes is not None:
+                                if minutes + 60 < prev_minutes:
+                                    try:
+                                        dt = datetime.strptime(working_date, "%Y-%m-%d") + timedelta(days=1)
+                                        working_date = dt.strftime("%Y-%m-%d")
+                                        offset += 1
+                                    except Exception:
+                                        pass
+
+                            if minutes is not None:
+                                prev_minutes = minutes
+
+                            if event_id == "unknown":
+                                event_id = f"{market_name}_page{page_num}_match{match_idx + 1}"
+
+                            if self._should_skip_started(match_time, working_date):
+                                page_skipped += 1
+                                total_skipped_started += 1
+                                logger.info(
+                                    f"    ⏭ SKIP started: {home_team} vs {away_team} | {working_date or 'Unknown'} {match_time}"
+                                )
+                                continue
+
+                            page_processed += 1
+                            total_processed += 1
+                            print(f"  ⚽ {home_team} vs {away_team} | {working_date or 'Unknown'} {match_time}")
+
+                            try:
+                                market_data = await self._extract_market_data(match_el, market_name, market_idx)
+
+                                if market_data.get("numbers_count", 0) > 0:
+                                    print(f"    ✅ {market_data['numbers_count']} odds")
+                                else:
+                                    print(f"    ⚠️  0 odds")
+
+                                if event_id not in all_events_data:
+                                    all_events_data[event_id] = {
+                                        "event_id": event_id,
+                                        "home_team": home_team,
+                                        "away_team": away_team,
+                                        "match_time": match_time,
+                                        "match_date": working_date or "",
+                                        "scrape_time": datetime.now().isoformat(),
+                                        "markets": {}
+                                    }
+
+                                all_events_data[event_id]["markets"][market_name] = market_data
+
+                                baseline[key] = {
+                                    "event_id": event_id,
+                                    "home_team": home_team,
+                                    "away_team": away_team,
+                                    "match_time": match_time,
+                                    "match_date": working_date or "",
+                                }
+
+                            except Exception as e:
+                                error_msg = str(e)[:50]
+                                print(f"    ❌ Error: {error_msg}...")
+
+                                if event_id not in all_events_data:
+                                    all_events_data[event_id] = {
+                                        "event_id": event_id,
+                                        "home_team": home_team,
+                                        "away_team": away_team,
+                                        "match_time": match_time,
+                                        "match_date": working_date or "",
+                                        "scrape_time": datetime.now().isoformat(),
+                                        "markets": {}
+                                    }
+
+                                all_events_data[event_id]["markets"][market_name] = {
+                                    "market_name": market_name,
+                                    "error": str(e),
+                                    "numbers_count": 0,
+                                    "all_numbers": [],
+                                    "timestamp": datetime.now().isoformat()
+                                }
+
+                        logger.info(
+                            f"  Page {page_num} summary: seen={page_seen} processed={page_processed} skipped_started={page_skipped}"
+                        )
+
+                    logger.info(
+                        f"  ✅ Completed {market_name} | processed={total_processed} skipped_started={total_skipped_started}"
+                    )
+                    market_idx += 1
+
+                if all_events_data:
+                    await self._save_all_events(all_events_data)
+                    logger.info(f"\n✅ Successfully collected data for {len(all_events_data)} matches")
+                    logger.info(f"📊 Total markets collected: {market_idx}")
+                else:
+                    logger.warning("No data collected!")
+
+            except Exception as e:
+                logger.critical(f"Critical error: {e}", exc_info=True)
+            finally:
+                await browser.close()
+
+    def _should_skip_started(self, match_time: str, match_date: Optional[str]) -> bool:
+        """
+        Skip only if date is known AND:
+          - match_date < today; or
+          - match_date == today and kickoff > 5 minutes ago.
+        If date is unknown, do not skip.
+        """
+        if not match_time or match_time == "Unknown":
+            return False
+        try:
+            hh, mm = map(int, match_time.split(":"))
+        except Exception:
+            return False
+
+        now = datetime.now()
+        if match_date:
+            try:
+                dt_date = datetime.strptime(match_date, "%Y-%m-%d").date()
+            except Exception:
+                dt_date = None
+        else:
+            dt_date = None
+
+        if dt_date:
+            candidate = datetime.combine(dt_date, datetime.min.time()).replace(hour=hh, minute=mm)
+            if candidate.date() < now.date():
+                return True
+            if candidate.date() == now.date() and (now - candidate) > timedelta(minutes=5):
+                return True
+            return False
+
+        return False
+
+    async def _get_real_page_numbers(self, page) -> List[int]:
+        """
+        Detect max page from input attributes (value/data-max/max/data-page).
+        If none found, return [1]. Cap at 15. Ensure 1 is present.
+        """
+        try:
+            max_candidate = 1
+            inputs = await page.query_selector_all("input")
+            for inp in inputs:
+                for attr in ("data-max", "max", "data-page", "value"):
+                    v = await inp.get_attribute(attr)
+                    if v and v.isdigit():
+                        num = int(v)
+                        if 1 <= num <= 15:
+                            max_candidate = max(max_candidate, num)
+            pages = list(range(1, max_candidate + 1))
+            return pages if pages else [1]
+        except Exception as e:
+            logger.warning(f"Error getting page numbers: {e}")
+            return [1]
+
+    async def _click_page_number(self, page, page_num: int) -> bool:
+        """Click page via inputs or links and verify DOM changed."""
+        try:
+            prev = await page.content()
+
+            inp = await page.query_selector(f"input[value='{page_num}']")
+            if not inp:
+                all_inp = await page.query_selector_all("input")
+                for cand in all_inp:
+                    for attr in ("data-page", "data-max", "max"):
+                        v = await cand.get_attribute(attr)
+                        if v and v.isdigit() and int(v) == page_num:
+                            inp = cand
+                            break
+                    if inp:
+                        break
+
+            if inp:
+                await inp.scroll_into_view_if_needed()
+                await inp.click(force=True)
+                await page.wait_for_timeout(400)
+                await page.wait_for_load_state("networkidle")
+                new = await page.content()
+                return new != prev
+
+            btn = await page.query_selector(f"a:has-text('{page_num}'), button:has-text('{page_num}')")
+            if btn:
+                await btn.scroll_into_view_if_needed()
+                await btn.click(force=True)
+                await page.wait_for_timeout(400)
+                await page.wait_for_load_state("networkidle")
+                new = await page.content()
+                return new != prev
+
+            return False
+        except Exception as e:
+            logger.warning(f"Page click failed: {e}")
+            return False
+
+    async def _set_page_size(self, page):
+        logger.info("Attempting to set page size to 50...")
+        selectors = [
+            'select[name*="per"]',
+            'select[class*="perpage"]',
+            'select[name*="record"]',
+            'select[id*="per"]',
+            'select:has(option[value="50"])'
+        ]
+        for selector in selectors:
+            try:
+                sel = await page.query_selector(selector)
+                if not sel:
+                    continue
+                await sel.select_option("50")
+                await page.evaluate("(el) => el.dispatchEvent(new Event('change', {bubbles: true}))", sel)
+                await page.wait_for_timeout(1500)
+                await page.wait_for_load_state("networkidle")
+                logger.info("Page size set to 50")
+                return True
+            except Exception:
+                continue
+
+        logger.warning("Could not set page size to 50, using default")
+        return False
+
+    async def _get_market_tabs(self, page) -> List[str]:
+        buttons = await page.query_selector_all("li.msl-cm-methods")
+        market_names = []
+        for btn in buttons:
+            try:
+                text = await btn.text_content()
+                if text and text.strip():
+                    market_names.append(text.strip())
+            except:
+                continue
+        return market_names
+
+    async def _get_current_page_matches(self, page) -> List:
+        selectors = [".msl-ls-item", ".match-row", "tr[data-ev-id]", "div[data-ev-id]"]
+        for selector in selectors:
+            matches = await page.query_selector_all(selector)
+            if matches:
+                return matches
+        return []
+
+    async def _click_market_button(self, page, market_name: str) -> bool:
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                await page.click(f"text='{market_name}'", timeout=3000)
+                await asyncio.sleep(2)
+                return True
+            except:
+                try:
+                    elements = await page.query_selector_all("li.msl-cm-methods")
+                    for elem in elements:
+                        text = await elem.text_content()
+                        if text and text.strip() == market_name:
+                            await elem.click()
+                            await asyncio.sleep(2)
+                            return True
+                except:
+                    pass
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+        logger.error(f"Failed to click market: {market_name}")
+        return False
+
+    async def _extract_match_header(self, match_el):
+        """
+        Extract (home, away, event_id, match_time).
+        Tries targeted selectors first, then falls back to '|' or 'vs' parsing.
+        """
+        try:
+            event_id = (
+                await match_el.get_attribute("data-ev-id")
+                or await match_el.get_attribute("data-event-id")
+                or "unknown"
+            )
+
+            selector_pairs = [
+                ("[class*='home']", "[class*='away']"),
+                (".msl-ls-home", ".msl-ls-away"),
+                (".msl-ls-team-home", ".msl-ls-team-away"),
+                (".team-home", ".team-away"),
+                ("[class*='team'][class*='home']", "[class*='team'][class*='away']"),
+            ]
+            home, away = None, None
+            for h_sel, a_sel in selector_pairs:
+                h_el = await match_el.query_selector(h_sel)
+                a_el = await match_el.query_selector(a_sel)
+                if h_el and a_el:
+                    h_txt = (await h_el.text_content() or "").strip()
+                    a_txt = (await a_el.text_content() or "").strip()
+                    if h_txt and a_txt:
+                        home, away = h_txt, a_txt
+                        break
+
+            text = (await match_el.text_content() or "").strip()
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+            if (not home or not away) and lines:
+                for i, line in enumerate(lines):
+                    if line == '|' and i > 0 and i + 1 < len(lines):
+                        home = home or lines[i - 1]
+                        away = away or lines[i + 1]
+                        break
+                    if "|" in line:
+                        parts = [p.strip() for p in line.split("|") if p.strip()]
+                        if len(parts) == 2:
+                            home = home or parts[0]
+                            away = away or parts[1]
+                            break
+                if (not home or not away):
+                    for line in lines[:3]:
+                        if "vs" in line.lower():
+                            parts = line.lower().split("vs")
+                            if len(parts) >= 2:
+                                home = home or parts[0].strip()
+                                away = away or parts[1].strip()
+                                break
+
+            match_time = self._extract_match_time(lines)
+
+            home = home or "Unknown"
+            away = away or "Unknown"
+            return home, away, event_id, match_time
+        except:
+            return "Unknown", "Unknown", "unknown", "Unknown"
+
+    def _extract_match_time(self, lines: List[str]) -> str:
+        """Extract a plausible HH:MM from lines."""
+        for line in lines:
+            if ':' in line and 4 <= len(line) <= 5:
+                try:
+                    h, m = line.split(':')
+                    if h.isdigit() and m.isdigit():
+                        hh, mm = int(h), int(m)
+                        if 0 <= hh < 24 and 0 <= mm < 60:
+                            return f"{hh:02d}:{mm:02d}"
+                except:
+                    continue
+        return "Unknown"
+
+    async def _extract_page_date(self, page) -> Optional[str]:
+        """
+        Extract page-level date like '2025 年 12 月 28 日' -> '2025-12-28'.
+        Returns None if not found.
+        """
+        try:
+            locator = page.locator(r"text=/\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日/").first
+            if await locator.count() > 0:
+                txt = await locator.inner_text()
+            else:
+                txt = await page.evaluate("() => document.body.innerText") or ""
+            m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", txt)
+            if m:
+                y, mo, d = m.groups()
+                return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        except Exception:
+            return None
+        return None
+
+    async def _extract_market_data(self, match_el, market_name: str, index: int) -> Dict:
+        try:
+            text = await match_el.text_content()
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+            numbers = self._extract_all_numbers(lines)
+
+            return {
+                "market_name": market_name,
+                "market_index": index,
+                "numbers_count": len(numbers),
+                "all_numbers": numbers,
+                "all_lines": lines,
+                "total_lines": len(lines),
+                "market_analysis": self._analyze_market_pattern(market_name, numbers),
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {
+                "market_name": market_name,
+                "market_index": index,
+                "error": str(e),
+                "numbers_count": 0,
+                "all_numbers": [],
+                "timestamp": datetime.now().isoformat()
+            }
+
+    def _extract_all_numbers(self, lines: List[str]) -> List[float]:
+        numbers = []
+        for line in lines:
+            parts = line.replace('\t', ' ').replace('|', ' ').split(' ')
+            for part in parts:
+                clean = part.replace(',', '').replace('—', '-').strip()
+                if self._is_number(clean):
+                    try:
+                        num = float(clean)
+                        if 0.5 <= num <= 1000:
+                            numbers.append(num)
+                    except:
+                        continue
+        return numbers
+
+    def _is_number(self, text: str) -> bool:
+        if not text:
+            return False
+        if text.startswith('-'):
+            text = text[1:]
+        return text.replace('.', '', 1).isdigit()
+
+    def _analyze_market_pattern(self, market_name: str, numbers: List[float]) -> Dict:
+        n = len(numbers)
+        if "波膽" in market_name and n == 26:
+            pattern, description = "CORRECT_SCORE_26", "10 pairs (home/away) + 6 home-only"
+        elif n == 3:
+            pattern, description = "THREE_WAY", "1X2 (Home/Draw/Away)"
+        elif n == 2:
+            pattern, description = "BINARY", "Two-way market"
+        elif n > 20:
+            pattern, description = "GRID_COMPLEX", f"Complex grid with {n} numbers"
+        else:
+            pattern, description = "UNKNOWN", f"Unknown pattern with {n} numbers"
+
+        stats = {}
+        if numbers:
+            stats = {
+                "min": min(numbers),
+                "max": max(numbers),
+                "avg": sum(numbers) / n,
+                "has_decimals": any(x != int(x) for x in numbers)
+            }
+
+        return {
+            "pattern_type": pattern,
+            "description": description,
+            "number_count": n,
+            "stats": stats
+        }
+
+    async def _save_all_events(self, all_events_data: Dict):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        json_file = self.output_dir / f"market_data_complete_{timestamp}.json"
+        complete_data = {
+            "scrape_time": datetime.now().isoformat(),
+            "total_events": len(all_events_data),
+            "events": all_events_data
+        }
+
+        json_file.write_text(
+            json.dumps(complete_data, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        logger.info(f"JSON saved: {json_file.name}")
+
+        csv_file = self.output_dir / f"market_summary_{timestamp}.csv"
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "EventID", "Home", "Away", "MatchDate", "MatchTime", "Market",
+                "NumbersCount", "PatternType", "HasError", "Warnings"
+            ])
+
+            for event_id, event_data in all_events_data.items():
+                for market_name, market_data in event_data.get("markets", {}).items():
+                    has_error = "error" in market_data
+                    warnings = ""
+                    if market_data.get("warnings"):
+                        warnings = "; ".join(market_data["warnings"])
+
+                    writer.writerow([
+                        event_id,
+                        event_data.get("home_team", ""),
+                        event_data.get("away_team", ""),
+                        event_data.get("match_date", ""),
+                        event_data.get("match_time", ""),
+                        market_name,
+                        market_data.get("numbers_count", 0),
+                        market_data.get("market_analysis", {}).get("pattern_type", ""),
+                        "YES" if has_error else "NO",
+                        warnings
+                    ])
+
+        logger.info(f"CSV saved: {csv_file.name}")
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Fixed Market Data Collector")
+    parser.add_argument("--visible", action="store_true", help="Run with visible browser")
+    parser.add_argument("--output", default="fixed_market_data", help="Output directory")
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("FIXED MARKET DATA COLLECTOR - REAL Page Numbers Only")
+    print("=" * 70)
+    print("Will only look for actual pagination inputs (1-15 max)")
+    print()
+
+    collector = FixedMarketsCollector(
+        headless=not args.visible,
+        output_dir=args.output
+    )
+
+    await collector.collect_all()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
